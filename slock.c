@@ -1,8 +1,5 @@
 /* See LICENSE file for license details. */
 #define _XOPEN_SOURCE 500
-#if HAVE_SHADOW_H
-#include <shadow.h>
-#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -22,6 +19,7 @@
 #include <X11/XKBlib.h>
 #include <X11/XF86keysym.h>
 #include <X11/extensions/dpms.h>
+#include <security/pam_appl.h>
 
 #include "arg.h"
 #include "util.h"
@@ -34,6 +32,7 @@ enum {
 	INPUT,
 	FAILED,
 	CAPS,
+	PAM,
 	NUMCOLS
 };
 
@@ -90,13 +89,58 @@ dontkillme(void)
 }
 #endif
 
-static const char *
-gethash(void)
+/*
+ * PAM conversation: answer every hidden prompt (pam_unix's "Password: ")
+ * with the typed password, which arrives in appdata_ptr. Info and error
+ * messages (pam_fprintd's "Place your finger on the reader") need no answer;
+ * they go to stderr. The responses are one array of num_msg entries, as
+ * Linux-PAM expects, and PAM frees them.
+ */
+static int
+pamconv(int num_msg, const struct pam_message **msg,
+        struct pam_response **resp, void *appdata_ptr)
 {
-	const char *hash;
+	struct pam_response *r;
+	int i;
+
+	if (num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG)
+		return PAM_CONV_ERR;
+	if (!(r = calloc(num_msg, sizeof(*r))))
+		return PAM_BUF_ERR;
+
+	for (i = 0; i < num_msg; i++) {
+		switch (msg[i]->msg_style) {
+		case PAM_PROMPT_ECHO_OFF:
+			if (!(r[i].resp = strdup((const char *)appdata_ptr)))
+				goto fail;
+			break;
+		case PAM_ERROR_MSG:
+		case PAM_TEXT_INFO:
+			fprintf(stderr, "slock: %s\n", msg[i]->msg);
+			break;
+		default: /* PAM_PROMPT_ECHO_ON: the user name is already known */
+			goto fail;
+		}
+	}
+	*resp = r;
+	return PAM_SUCCESS;
+
+fail:
+	for (i = 0; i < num_msg; i++) {
+		if (r[i].resp) {
+			explicit_bzero(r[i].resp, strlen(r[i].resp));
+			free(r[i].resp);
+		}
+	}
+	free(r);
+	return PAM_CONV_ERR;
+}
+
+static const char *
+getusername(void)
+{
 	struct passwd *pw;
 
-	/* Check if the current user has a password entry */
 	errno = 0;
 	if (!(pw = getpwuid(getuid()))) {
 		if (errno)
@@ -104,40 +148,18 @@ gethash(void)
 		else
 			die("slock: cannot retrieve password entry\n");
 	}
-	hash = pw->pw_passwd;
-
-#if HAVE_SHADOW_H
-	if (!strcmp(hash, "x")) {
-		struct spwd *sp;
-		if (!(sp = getspnam(pw->pw_name)))
-			die("slock: getspnam: cannot retrieve shadow entry. "
-			    "Make sure to suid or sgid slock.\n");
-		hash = sp->sp_pwdp;
-	}
-#else
-	if (!strcmp(hash, "*")) {
-#ifdef __OpenBSD__
-		if (!(pw = getpwuid_shadow(getuid())))
-			die("slock: getpwnam_shadow: cannot retrieve shadow entry. "
-			    "Make sure to suid or sgid slock.\n");
-		hash = pw->pw_passwd;
-#else
-		die("slock: getpwuid: cannot retrieve shadow entry. "
-		    "Make sure to suid or sgid slock.\n");
-#endif /* __OpenBSD__ */
-	}
-#endif /* HAVE_SHADOW_H */
-
-	return hash;
+	return pw->pw_name;
 }
 
 static void
 readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
-       const char *hash)
+       const char *username)
 {
 	XRRScreenChangeNotifyEvent *rre;
-	char buf[32], passwd[256], *inputhash;
-	int num, screen, running, failure, oldc;
+	char buf[32], passwd[256];
+	int num, screen, running, failure, oldc, retval;
+	struct pam_conv conv = { pamconv, passwd };
+	pam_handle_t *pamh;
 	unsigned int len, color;
 	int caps;
 	unsigned int indicators;
@@ -172,11 +194,29 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			switch (ksym) {
 			case XK_Return:
 				passwd[len] = '\0';
-				errno = 0;
-				if (!(inputhash = crypt(passwd, hash)))
-					fprintf(stderr, "slock: crypt: %s\n", strerror(errno));
+				/* PAM can block (pam_fprintd waits for a finger):
+				 * show the PAM color while it runs. */
+				for (screen = 0; screen < nscreens; screen++) {
+					XSetWindowBackground(dpy, locks[screen]->win,
+					                     locks[screen]->colors[PAM]);
+					XClearWindow(dpy, locks[screen]->win);
+				}
+				XSync(dpy, False);
+				oldc = PAM;
+
+				pamh = NULL;
+				retval = pam_start(pam_service, username, &conv, &pamh);
+				if (retval == PAM_SUCCESS)
+					retval = pam_authenticate(pamh, 0);
+				if (retval == PAM_SUCCESS)
+					retval = pam_acct_mgmt(pamh, 0);
+				if (retval == PAM_SUCCESS)
+					running = 0;
 				else
-					running = !!strcmp(inputhash, hash);
+					fprintf(stderr, "slock: %s\n",
+					        pam_strerror(pamh, retval));
+				if (pamh)
+					pam_end(pamh, retval);
 				if (running) {
 					XBell(dpy, 100);
 					failure = 1;
@@ -337,11 +377,9 @@ int
 main(int argc, char **argv) {
 	struct xrandr rr;
 	struct lock **locks;
-	struct passwd *pwd;
-	struct group *grp;
 	uid_t duid;
 	gid_t dgid;
-	const char *hash;
+	const char *username;
 	Display *dpy;
 	int s, nlocks, nscreens;
 	CARD16 standby, suspend, off;
@@ -353,26 +391,20 @@ main(int argc, char **argv) {
 		usage();
 	} ARGEND
 
-	/* validate drop-user and -group */
-	errno = 0;
-	if (!(pwd = getpwnam(user)))
-		die("slock: getpwnam %s: %s\n", user,
-		    errno ? strerror(errno) : "user entry not found");
-	duid = pwd->pw_uid;
-	errno = 0;
-	if (!(grp = getgrnam(group)))
-		die("slock: getgrnam %s: %s\n", group,
-		    errno ? strerror(errno) : "group entry not found");
-	dgid = grp->gr_gid;
+	/*
+	 * Drop privileges to the user who runs slock, not to nobody.
+	 * pam_unix checks the password through unix_chkpwd, and unix_chkpwd
+	 * checks only the password of its calling user. fprintd also allows a
+	 * verify only for the session user (polkit).
+	 */
+	duid = getuid();
+	dgid = getgid();
 
 #ifdef __linux__
 	dontkillme();
 #endif
 
-	hash = gethash();
-	errno = 0;
-	if (!crypt("", hash))
-		die("slock: crypt: %s\n", strerror(errno));
+	username = getusername();
 
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("slock: cannot open display\n");
@@ -437,7 +469,7 @@ main(int argc, char **argv) {
 	}
 
 	/* everything is now blank. Wait for the correct password */
-	readpw(dpy, &rr, locks, nscreens, hash);
+	readpw(dpy, &rr, locks, nscreens, username);
 	/* reset DPMS values to inital ones */
 	DPMSSetTimeouts(dpy, standby, suspend, off);
 	XSync(dpy, 0);
