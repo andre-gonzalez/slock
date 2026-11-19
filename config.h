@@ -1,16 +1,17 @@
-/* user and group to drop privileges to */
-static const char *user  = "nobody";
-static const char *group = "nobody"; // use "nobody" for arch
-
 static const char *colorname[NUMCOLS] = {
 	[INIT] =   "black",     /* after initialization */
 	[INPUT] =  "#005577",   /* during input */
 	[FAILED] = "#CC3333",   /* wrong password */
 	[CAPS] =   "yellow",       /* CapsLock on */
+	[PAM] =    "#9400D3",   /* waiting for PAM (password or finger) */
 };
 
 
 
+
+/* PAM service for authentication: /etc/pam.d/slock. NixOS creates it with
+ * security.pam.services.slock. Without that file, PAM uses "other". */
+static const char *pam_service = "slock";
 
 /* treat a cleared input like a wrong password (color) */
 static const int failonclear = 1;

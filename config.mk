@@ -14,7 +14,7 @@ X11LIB = /usr/X11R6/lib
 #XINERAMA=-lXinerama
 
 # Uncomment for pam auth patch / PAMAUTH_PATCH
-#PAM=-lpam
+PAM=-lpam
 
 # Uncomment for blur pixelated screen patch / BLUR_PIXELATED_SCREEN_PATCH
 #IMLIB=-lImlib2
